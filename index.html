@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>BEYOND2026 参加表明ジェネレーター</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #111111;
+    --muted: #767676;
+    --line: #e2e2e2;
+    --accent: #1b1b1b;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body {
+    margin: 0;
+    padding: 32px 20px 64px;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "Helvetica Neue", Arial, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    line-height: 1.7;
+  }
+  .wrap { max-width: 520px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: .02em; }
+  .lead { font-size: 13px; color: var(--muted); margin: 0 0 28px; }
+
+  .stage {
+    position: relative;
+    width: 100%;
+    border: 1px solid var(--line);
+    background: #f6f6f6;
+    overflow: hidden;
+    touch-action: none;
+  }
+  canvas { display: block; width: 100%; height: auto; }
+  .caption { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+
+  .controls { margin-top: 20px; display: grid; gap: 16px; }
+  .row { display: grid; gap: 6px; }
+  label { font-size: 12px; color: var(--muted); }
+
+  button, .filebtn {
+    appearance: none; border: 1px solid var(--accent); background: var(--accent);
+    color: #fff; font-size: 14px; padding: 13px 16px; border-radius: 4px;
+    cursor: pointer; text-align: center; font-family: inherit; width: 100%;
+  }
+  button.ghost, .filebtn.ghost { background: #fff; color: var(--accent); }
+  button:disabled { opacity: .35; cursor: default; }
+  input[type=file] { display: none; }
+  input[type=range] { width: 100%; }
+
+  .hint { font-size: 12px; color: var(--muted); margin-top: 24px; }
+  .hint code { background: #f3f3f3; padding: 1px 5px; border-radius: 3px; }
+  .err { color: #b00020; font-size: 13px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>BEYOND2026 参加表明ジェネレーター</h1>
+  <p class="lead">写真を選んで、位置と大きさを合わせるだけ。SNSシェア用の画像をダウンロードできます。</p>
+
+  <div class="stage" id="stage">
+    <canvas id="canvas"></canvas>
+  </div>
+  <p class="caption" id="caption">中央の枠に写真がはめ込まれます。</p>
+
+  <div class="controls">
+    <label class="filebtn" for="file" id="filelabel">写真を選ぶ</label>
+    <input type="file" id="file" accept="image/*">
+
+    <div class="row" id="zoomRow" hidden>
+      <label for="zoom">大きさ（画像をドラッグすると位置を調整できます）</label>
+      <input type="range" id="zoom" min="100" max="400" value="100">
+    </div>
+
+    <button id="download" disabled>画像をダウンロード</button>
+    <button id="reset" class="ghost" hidden>位置をリセット</button>
+  </div>
+
+  <p class="err" id="err" hidden></p>
+
+  <p class="hint">
+    選んだ写真はブラウザの中だけで処理され、サーバーには一切送信されません。<br>
+    保存した画像に <code>#BEYOND2026</code> を付けて投稿してください。
+  </p>
+</div>
+
+<script>
+(function () {
+  // ===== 設定 =====================================================
+  // 枠デザイン画像（この画像のサイズがそのまま出力サイズになる）
+  var FRAME_SRC = 'assets/frame.png';
+
+  // 写真より「上」に重ねる要素だけを抜いた透過PNG（BEYONDロゴ・右下のオブジェクト）
+  // 不要なら null にする。
+  var OVERLAY_SRC = 'assets/overlay.png';
+
+  // 写真をはめ込む領域。枠画像の幅・高さに対する比率で指定する。
+  // 枠デザインを差し替えたらここの数値を調整する。
+  // 現在の枠（1080x1350）では 361,401 から 670x648 px の範囲。
+  var PHOTO_AREA = { x: 0.3343, y: 0.2970, w: 0.6204, h: 0.4800 };
+  // ================================================================
+
+  var canvas = document.getElementById('canvas');
+  var ctx = canvas.getContext('2d');
+  var stage = document.getElementById('stage');
+  var fileInput = document.getElementById('file');
+  var zoomRow = document.getElementById('zoomRow');
+  var zoomInput = document.getElementById('zoom');
+  var downloadBtn = document.getElementById('download');
+  var resetBtn = document.getElementById('reset');
+  var errEl = document.getElementById('err');
+
+  var frame = null;
+  var overlay = null;
+  var photo = null;
+  var area = null;      // 実ピクセルでのはめ込み領域
+  var baseScale = 1;    // 領域を覆う最小倍率
+  var scale = 1;
+  var offset = { x: 0, y: 0 };   // 領域中心からのズレ（実ピクセル）
+
+  function showError(msg) {
+    errEl.textContent = msg;
+    errEl.hidden = false;
+  }
+
+  // --- 枠画像の読み込み -------------------------------------------
+  var frameImg = new Image();
+  frameImg.onload = function () {
+    frame = frameImg;
+    canvas.width = frame.naturalWidth;
+    canvas.height = frame.naturalHeight;
+    area = {
+      x: canvas.width * PHOTO_AREA.x,
+      y: canvas.height * PHOTO_AREA.y,
+      w: canvas.width * PHOTO_AREA.w,
+      h: canvas.height * PHOTO_AREA.h
+    };
+    draw();
+  };
+  frameImg.onerror = function () {
+    showError('枠デザイン（assets/frame.png）が読み込めませんでした。ファイルを配置してください。');
+  };
+  frameImg.src = FRAME_SRC;
+
+  // --- 上レイヤーの読み込み（任意） -------------------------------
+  if (OVERLAY_SRC) {
+    var overlayImg = new Image();
+    overlayImg.onload = function () { overlay = overlayImg; draw(); };
+    overlayImg.src = OVERLAY_SRC;
+  }
+
+  // --- 描画 --------------------------------------------------------
+  function draw() {
+    if (!frame) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+
+    if (photo) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(area.x, area.y, area.w, area.h);
+      ctx.clip();
+
+      var w = photo.naturalWidth * baseScale * scale;
+      var h = photo.naturalHeight * baseScale * scale;
+      var cx = area.x + area.w / 2 + offset.x;
+      var cy = area.y + area.h / 2 + offset.y;
+      ctx.drawImage(photo, cx - w / 2, cy - h / 2, w, h);
+      ctx.restore();
+    }
+
+    if (overlay) ctx.drawImage(overlay, 0, 0, canvas.width, canvas.height);
+  }
+
+  function clampOffset() {
+    var w = photo.naturalWidth * baseScale * scale;
+    var h = photo.naturalHeight * baseScale * scale;
+    var maxX = Math.max(0, (w - area.w) / 2);
+    var maxY = Math.max(0, (h - area.h) / 2);
+    offset.x = Math.min(maxX, Math.max(-maxX, offset.x));
+    offset.y = Math.min(maxY, Math.max(-maxY, offset.y));
+  }
+
+  function resetTransform() {
+    baseScale = Math.max(area.w / photo.naturalWidth, area.h / photo.naturalHeight);
+    scale = 1;
+    offset.x = 0;
+    offset.y = 0;
+    zoomInput.value = 100;
+    draw();
+  }
+
+  // --- 写真の読み込み ---------------------------------------------
+  function loadFile(file) {
+    if (!file || !/^image\//.test(file.type)) return;
+    if (!area) { showError('枠デザインの読み込みが終わっていません。'); return; }
+    var url = URL.createObjectURL(file);
+    var img = new Image();
+    img.onload = function () {
+      URL.revokeObjectURL(url);
+      photo = img;
+      errEl.hidden = true;
+      document.getElementById('caption').textContent =
+        'ドラッグで位置、スライダーやピンチで大きさを調整できます。';
+      zoomRow.hidden = false;
+      resetBtn.hidden = false;
+      downloadBtn.disabled = false;
+      document.getElementById('filelabel').textContent = '写真を選び直す';
+      resetTransform();
+    };
+    img.onerror = function () { showError('この画像は読み込めませんでした。別の写真を試してください。'); };
+    img.src = url;
+  }
+
+  fileInput.addEventListener('change', function (e) { loadFile(e.target.files[0]); });
+
+  stage.addEventListener('dragover', function (e) { e.preventDefault(); });
+  stage.addEventListener('drop', function (e) {
+    e.preventDefault();
+    loadFile(e.dataTransfer.files[0]);
+  });
+
+  // --- 拡大縮小 ----------------------------------------------------
+  zoomInput.addEventListener('input', function () {
+    if (!photo) return;
+    scale = Number(zoomInput.value) / 100;
+    clampOffset();
+    draw();
+  });
+
+  // --- ドラッグで位置調整 ------------------------------------------
+  var dragging = false;
+  var last = null;
+  var pointers = new Map();
+  var pinchStart = null;
+
+  function toCanvas(e) {
+    var rect = canvas.getBoundingClientRect();
+    var k = canvas.width / rect.width;
+    return { x: (e.clientX - rect.left) * k, y: (e.clientY - rect.top) * k };
+  }
+
+  stage.addEventListener('pointerdown', function (e) {
+    if (!photo) return;
+    stage.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, e);
+    if (pointers.size === 1) {
+      dragging = true;
+      last = toCanvas(e);
+    } else if (pointers.size === 2) {
+      dragging = false;
+      var pts = Array.from(pointers.values());
+      pinchStart = {
+        dist: Math.hypot(pts[0].clientX - pts[1].clientX, pts[0].clientY - pts[1].clientY),
+        scale: scale
+      };
+    }
+  });
+
+  stage.addEventListener('pointermove', function (e) {
+    if (!photo || !pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, e);
+
+    if (pointers.size >= 2 && pinchStart) {
+      var pts = Array.from(pointers.values());
+      var d = Math.hypot(pts[0].clientX - pts[1].clientX, pts[0].clientY - pts[1].clientY);
+      scale = Math.min(4, Math.max(1, pinchStart.scale * (d / pinchStart.dist)));
+      zoomInput.value = Math.round(scale * 100);
+      clampOffset();
+      draw();
+      return;
+    }
+
+    if (!dragging) return;
+    var p = toCanvas(e);
+    offset.x += p.x - last.x;
+    offset.y += p.y - last.y;
+    last = p;
+    clampOffset();
+    draw();
+  });
+
+  function endPointer(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinchStart = null;
+    if (pointers.size === 0) dragging = false;
+  }
+  stage.addEventListener('pointerup', endPointer);
+  stage.addEventListener('pointercancel', endPointer);
+
+  stage.addEventListener('wheel', function (e) {
+    if (!photo) return;
+    e.preventDefault();
+    scale = Math.min(4, Math.max(1, scale * (e.deltaY < 0 ? 1.06 : 0.94)));
+    zoomInput.value = Math.round(scale * 100);
+    clampOffset();
+    draw();
+  }, { passive: false });
+
+  resetBtn.addEventListener('click', function () { if (photo) resetTransform(); });
+
+  // --- ダウンロード ------------------------------------------------
+  var FILENAME = 'BEYOND2026_参加表明.png';
+
+  function saveBlob(blob) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = FILENAME;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+  }
+
+  downloadBtn.addEventListener('click', function () {
+    var blob;
+    try {
+      blob = null;
+      canvas.toBlob(function (b) {
+        if (!b) { showError('画像の書き出しに失敗しました。ページを再読み込みして試してください。'); return; }
+        // iPhone / iPad は端末の共有シートから保存する方が確実
+        var file = (typeof File === 'function') ? new File([b], FILENAME, { type: 'image/png' }) : null;
+        if (file && navigator.canShare && navigator.canShare({ files: [file] })) {
+          navigator.share({ files: [file] }).catch(function () { saveBlob(b); });
+        } else {
+          saveBlob(b);
+        }
+      }, 'image/png');
+    } catch (e) {
+      showError('この開き方では画像を保存できません。'
+        + 'HTMLファイルを直接ダブルクリックで開いている場合は、公開URL経由で開いてください。');
+    }
+  });
+})();
+</script>
+</body>
+</html>
